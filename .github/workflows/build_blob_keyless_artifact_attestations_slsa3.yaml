@@ -1,0 +1,148 @@
+name: Attestation Sign and verify blobs without keys
+
+on:
+  workflow_call:
+    inputs:
+      git_tag:
+        required: false
+        type: string
+    secrets:
+      gh_token:
+        description: 'GitHub Token for authentication'
+        required: true
+
+jobs:
+  build:
+    name: Build and sign
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Signing and Artifact attestations.
+      attestations: write # Generate Artifact attestations.
+      contents: write # Create a release.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0 # Doesn't support only v4 yet.
+        with:
+          cosign-release: 'v3.0.2'
+
+      - name: Build a blob
+        id: blob
+        run: |
+          zig_mirror=$(curl -fsSL https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -fsSL https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          curl -fsSL "${zig_mirror}/${zig_tarball_x86_64_linux_master}" -o "$zig_tarball_x86_64_linux_master"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+
+      - name: Generate checksum of blob
+        run: sha256sum ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }} > ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum
+
+      - name: Sign blob
+        run: |
+          cosign sign-blob \
+              --bundle ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --yes \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      - name: Output Sigstore Bundle
+        run: jq '.' ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json
+
+      - name: Generate SBOM of blob
+        uses: anchore/sbom-action@v0
+        with:
+          file: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+          format: spdx-json
+          output-file: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
+
+      - name: Attest SBOM
+        id: attest_sbom
+        uses: actions/attest-sbom@v3
+        with:
+          subject-path: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+          sbom-path: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
+
+      - name: Attest Build Provenance
+        id: attest_provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
+
+      # Blob, Sigstore Bundle and OIDC Provider (GitHub) are used for verification.
+
+      # https://github.com/<USER>/<REPOSITORY>/.github/workflows/<WORKFLOW>@refs/heads/<BRANCH>
+      # In this case, the certificate identity is equal to https://github.com/LKHN/sigstore-playground/.github/workflows/sigstore_blob_keyless.yaml@refs/heads/main
+      - name: Verify blob manifest using exact identitiy
+        run: |
+          cosign verify-blob \
+              --bundle ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --certificate-identity="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/.github/workflows/build_blob_keyless_artifact_attestations_slsa3.yaml@refs/heads/main" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      # Matches https://github.com/LKHN/sigstore-playground
+      - name: Verify image manifest using regexp
+        run: |
+          cosign verify-blob \
+              --bundle ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --certificate-identity-regexp="^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      - name: Verify provenance attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_FORCE_TTY: true
+        run: |
+          gh attestation verify \
+              --repo "$GITHUB_REPOSITORY" \
+              --format json \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      - name: Verify SBOM attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_FORCE_TTY: true
+        run: |
+          gh attestation verify \
+              --repo "$GITHUB_REPOSITORY" \
+              --format json \
+              --predicate-type 'https://spdx.dev/Document/v2.3' \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      - name: Get transparency log entry of Signing
+        id: tlog_signing
+        run: |
+          tlog_index=$(jq -r '.verificationMaterial.tlogEntries[].logIndex' \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json)
+          printf '%s=%s\n' 'index' "$tlog_index" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes with transparency logs
+        run: |
+          cat > release_notes.md <<'EOF'
+          The transparency log entries is browsable at:
+          - **Signing:** https://search.sigstore.dev/?logIndex=${{ steps.tlog_signing.outputs.index }}
+          - **Artifact attestation:** ${{ steps.attest_provenance.outputs.attestation-url }}
+          - **SBOM attestation:** ${{ steps.attest_sbom.outputs.attestation-url }}
+          EOF
+
+      - name: Release
+        if: ${{ inputs.git_tag }}
+        env:
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: |
+          gh release create \
+              blob_keyless_aa/${{ inputs.git_tag }} \
+              --generate-notes \
+              --notes-file release_notes.md \
+              --title "Release of ${{ inputs.git_tag }}" \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }} \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
