@@ -1,0 +1,42 @@
+name: Sigstore Cosign signing and verification with keys
+on: workflow_dispatch
+jobs:
+  signandverify:
+    name: Sign and verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.5.3'
+
+      - name: Get zig release tarball as a blob
+        id: zig_release_tarball
+        run: |
+          zig_mirror=$(curl -sS -f https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -sS -f https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+          curl -sS -f ${zig_mirror}/${zig_tarball_x86_64_linux_master} -o ${zig_tarball_x86_64_linux_master}
+
+      - name: Sign a blob
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          printf '%s\n' "${{ secrets.SIGSTORE_PRIVATE_KEY }}" > sigstore.key && chmod 0400 sigstore.key
+          cosign sign-blob \
+              --key sigstore.key \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format \
+              --yes
+          rm -fv sigstore.key
+
+      - name: Verify the signed blob using public key and sigstore bundle
+        run: |
+          curl -sS -f https://raw.githubusercontent.com/LKHN/sigstore-playground/refs/heads/main/sigstore.pub -o sigstore.pub
+          cosign verify-blob \
+              --key sigstore.pub \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format
