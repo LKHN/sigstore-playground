@@ -1,0 +1,183 @@
+name: Sign and verify blobs without keys
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_tag:
+        description: 'Git tag to create a GitHub release'
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build and sign
+    permissions:
+      id-token: write # Use GitHub OIDC provider to generate ephemeral signing keys.
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256sum_base64: ${{ steps.generate_hashes.outputs.sha256sum_base64 }}
+      zig_tarball_x86_64_linux_master: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0
+        with:
+          cosign-release: 'v3.0.2'
+
+      - name: Create a blob
+        id: blob
+        run: |
+          zig_mirror=$(curl -fsSL https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -fsSL https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          curl -fsSL "${zig_mirror}/${zig_tarball_x86_64_linux_master}" -o "$zig_tarball_x86_64_linux_master"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+
+      - name: Generate checksum
+        run: sha256sum ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }} > ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum
+
+      - name: Sign a blob with Cosign
+        run: |
+          cosign sign-blob \
+              --bundle ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --yes \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+
+      - name: Output Sigstore Bundle
+        run: jq '.' ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          file: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+          format: spdx-json
+          output-file: ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
+
+      - name: Generate base64 encoded hashes for slsa provenance generator
+        id: generate_hashes
+        run: |
+          hashes=$(sha256sum \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }} \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json \
+              | base64 -w0)
+          printf '%s=%s\n' 'sha256sum_base64' "$hashes" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_artifacts
+          if-no-files-found: error
+          path: |
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sha256sum
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json
+            ${{ steps.blob.outputs.zig_tarball_x86_64_linux_master }}.spdx.json
+
+  provenance:
+    name: Generate SLSA Build Level 3 provenance
+    permissions:
+      actions: read # Needed for detection of GitHub Actions environment.
+      id-token: write # Needed for provenance signing and ID.
+      contents: write # Upload assets.
+    needs:
+      - build
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.1.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.sha256sum_base64 }}"
+
+  verify:
+    name: Verify
+    needs:
+      - build
+      - provenance
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v5
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.0.0
+        with:
+          cosign-release: 'v3.0.2'
+
+      # Blob, Sigstore Bundle and OIDC Provider (GitHub) are used for verification.
+
+      # https://github.com/<USER>/<REPOSITORY>/.github/workflows/<WORKFLOW>@refs/heads/<BRANCH>
+      # In this case, the certificate identity is equal to https://github.com/LKHN/sigstore-playground/.github/workflows/sigstore_blob_keyless.yaml@refs/heads/main
+      - name: Verify blob manifest using exact identitiy
+        run: |
+          cosign verify-blob \
+              --bundle build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --certificate-identity="${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}
+
+      # Matches https://github.com/LKHN/sigstore-playground
+      - name: Verify image manifest using regexp
+        run: |
+          cosign verify-blob \
+              --bundle build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --certificate-identity-regexp="^${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}
+
+  release:
+    name: Release
+    permissions:
+      contents: write # Create GitHub Release.
+    needs:
+      - build
+      - provenance
+      - verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v5
+
+      - name: Get transparency log entry of Signing
+        id: tlog_signing
+        run: |
+          tlog_index=$(jq -r '.verificationMaterial.tlogEntries[].logIndex' \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json)
+          printf '%s=%s\n' 'index' "$tlog_index" >> "$GITHUB_OUTPUT"
+
+      - name: Get transparency log entry of SLSA provenance
+        id: tlog_provenance
+        run: |
+          tlog_index=$(jq -r '.verificationMaterial.tlogEntries[].logIndex' \
+              multiple.intoto.jsonl/multiple.intoto.jsonl)
+          printf '%s=%s\n' 'index' "$tlog_index" >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes with transparency logs
+        run: |
+          cat > release_notes.md <<'EOF'
+          The transparency log entries is browsable at:
+          - **Signing:** https://search.sigstore.dev/?logIndex=${{ steps.tlog_signing.outputs.index }}
+          - **SLSA provenance:** https://search.sigstore.dev/?logIndex=${{ steps.tlog_provenance.outputs.index }}
+          EOF
+
+      - name: Release a blob with Sigstore Bundle SBOM and SLSA provenance
+        if: ${{ inputs.git_tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create \
+              ${{ inputs.git_tag }} \
+              --generate-notes \
+              --notes-file release_notes.md \
+              --title "Release of ${{ inputs.git_tag }}" \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }} \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.sha256sum \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              build_artifacts/${{ needs.build.outputs.zig_tarball_x86_64_linux_master }}.spdx.json \
+              multiple.intoto.jsonl/multiple.intoto.jsonl
