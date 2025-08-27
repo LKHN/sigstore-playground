@@ -1,0 +1,38 @@
+name: Build with GitHub Artifact Attestation
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_tag:
+        description: 'Git tag to create a GitHub release'
+        required: false
+        type: string
+      is_build_blob:
+        description: 'Build a blob'
+        required: false
+        type: boolean
+      is_build_container:
+        description: 'Build a container'
+        required: false
+        type: boolean
+
+jobs:
+  build_blob:
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Signing and Artifact attestations.
+      attestations: write # Generate Artifact attestations.
+    if: ${{ inputs.is_build_blob }}
+    uses: ./.github/workflows/build_blob_artifact_attestations_slsa3.yaml
+    with:
+      git_tag: ${{ inputs.git_tag }}
+
+  # build_container:
+  #   permissions:
+  #     attestations: write # GitHub Artifact attestations.
+  #     contents: read
+  #     id-token: write # Use GitHub OIDC provider to generate ephemeral keys for signing.
+  #     packages: write # Push container images to ghcr.io.
+  #   if: ${{ inputs.is_container }}
+  #   uses: ./.github/workflows/build_container_artifact_attestations_slsa3.yaml
+  #   with:
+  #     git_tag: ${{ inputs.git_tag }}
