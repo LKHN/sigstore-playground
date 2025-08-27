@@ -1,0 +1,82 @@
+name: Build with GitHub Artifact attestations
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_tag:
+        description: 'Git tag to create a GitHub release'
+        required: false
+        type: string
+      is_build_blob:
+        description: 'Build a blob'
+        required: false
+        type: boolean
+      is_build_container:
+        description: 'Build a container'
+        required: false
+        type: boolean
+      with_keys:
+        description: 'Build with keys'
+        required: true
+        type: boolean
+
+jobs:
+  build_blob_key:
+    name: Sign and verify blobs with keys
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Artifact attestations.
+      attestations: write # Generate Artifact attestations.
+      contents: write # Create a release.
+    if: ${{ inputs.is_build_blob && inputs.with_keys }}
+    uses: ./.github/workflows/build_blob_key_artifact_attestations_slsa3.yaml
+    with:
+      git_tag: ${{ inputs.git_tag }}
+      sigstore_public_key: sigstore.pub
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+      cosign_password: ${{ secrets.COSIGN_PASSWORD }}
+      sigstore_private_key: ${{ secrets.SIGSTORE_PRIVATE_KEY }}
+
+  build_blob_keyless:
+    name: Sign and verify blobs without keys
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Signing and Artifact attestations.
+      attestations: write # Generate Artifact attestations.
+      contents: write # Create a release.
+    if: ${{ inputs.is_build_blob && !inputs.with_keys }}
+    uses: ./.github/workflows/build_blob_keyless_artifact_attestations_slsa3.yaml
+    with:
+      git_tag: ${{ inputs.git_tag }}
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+  build_container_key:
+    name: Sign and verify containers with keys
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Artifact attestations.
+      attestations: write # GitHub Artifact attestations.
+      packages: write # Push container images to ghcr.io.
+      contents: write # Create a release.
+    if: ${{ inputs.is_build_container && inputs.with_keys }}
+    uses: ./.github/workflows/build_container_key_artifact_attestations_slsa3.yaml
+    with:
+      git_tag: ${{ inputs.git_tag }}
+      sigstore_public_key: sigstore.pub
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
+      cosign_password: ${{ secrets.COSIGN_PASSWORD }}
+      sigstore_private_key: ${{ secrets.SIGSTORE_PRIVATE_KEY }}
+
+  build_container_keyless:
+    name: Sign and verify containers without keys
+    permissions:
+      id-token: write # Use GitHub OIDC provider for Signing and Artifact attestations.
+      attestations: write # GitHub Artifact attestations.
+      packages: write # Push container images to ghcr.io.
+      contents: write # Create a release.
+    if: ${{ inputs.is_build_container && !inputs.with_keys }}
+    uses: ./.github/workflows/build_container_keyless_artifact_attestations_slsa3.yaml
+    with:
+      git_tag: ${{ inputs.git_tag }}
+    secrets:
+      gh_token: ${{ secrets.GITHUB_TOKEN }}
