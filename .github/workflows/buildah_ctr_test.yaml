@@ -1,0 +1,37 @@
+name: Testing buildah in container
+on: workflow_dispatch
+jobs:
+  signandverify:
+    name: Sign and verify
+    runs-on: ubuntu-22.04
+    container:
+      image: quay.io/buildah/stable:latest
+      options: --device /dev/fuse:rw --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    steps:
+      - name: Install ci deps
+        run: |
+          dnf -y install git-core jq
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.6.0'
+
+      - name: Get zig release tarball as a blob
+        id: zig_release_tarball
+        run: |
+          zig_mirror=$(curl -sS -f https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -sS -f https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+          curl -sS -f "${zig_mirror}/${zig_tarball_x86_64_linux_master}" -o "$zig_tarball_x86_64_linux_master"
+
+      - name: Build a container image
+        id: container_image
+        run: |
+          buildah --log-level debug unshare ./zig_container.sh ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}
+          image_id=$(cat ./image_id.txt)
+          printf 'DEBUG: The image_id contains: %s\n' "$image_id" # DEBUG
+          printf '%s=%s\n' 'image_id' "$image_id" >> "$GITHUB_OUTPUT"
