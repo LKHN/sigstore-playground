@@ -1,0 +1,84 @@
+name: Sigstore Cosign signing and verification with keys
+on: workflow_dispatch
+jobs:
+  signandverify:
+    name: Sign and verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.5.3'
+
+      - name: Get zig release tarball as a blob
+        id: zig_release_tarball
+        run: |
+          zig_mirror=$(curl -sS -f https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -sS -f https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+          curl -sS -f "${zig_mirror}/${zig_tarball_x86_64_linux_master}" -o "$zig_tarball_x86_64_linux_master"
+
+      - name: Sign a blob
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGSTORE_PRIVATE_KEY: ${{ secrets.SIGSTORE_PRIVATE_KEY }}
+        run: |
+          cosign sign-blob \
+              --key env://SIGSTORE_PRIVATE_KEY \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format \
+              --yes
+
+      # - name: Verify the signed blob using public key and sigstore bundle
+      #   run: |
+      #     curl -sS -f https://raw.githubusercontent.com/LKHN/sigstore-playground/refs/heads/main/sigstore.pub -o sigstore.pub
+      #     cosign verify-blob \
+      #         --key sigstore.pub \
+      #         ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+      #         --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+      #         --new-bundle-format
+
+      - name: Build a container image
+        id: container_image
+        run: |
+          ls -lhaF
+          image_id=$(buildah unshare ./zig_container.sh ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }})
+          cat -e "$image_id"
+          printf '%s=%s\n' 'image_id' "$image_id" >> "$GITHUB_OUTPUT"
+
+      - name: Create a manifest
+        id: manifest
+        run: |
+          local_manifest_id=$(buildah manifest create --annotation org.opencontainers.image.source="${GITHUB_SERVER_URL}"/"${GITHUB_REPOSITORY}" sigstore-playground:zig-key)
+          printf '%s=%s/n' 'local_manifest_id' "$local_manifest_id" >> "$GITHUB_OUTPUT"
+
+      - name: Add images into manfest
+        run: |
+          buildah manifest add ${{ steps.manifest.outputs.local_manifest_id }} ${{ steps.container_image.outputs.image_id }}
+
+      - name: Login to GHCR.io
+        run: |
+          printf '%s' "${{ secrets.GITHUB_TOKEN }}" | buildah login -u ${{ github.actor }} --password-stdin ghcr.io
+
+      - name: Push manifest to ghcr.io
+        id: ghcr_manifest
+        run: |
+          ghcr_manifest_id=$(buildah manifest push ${{ steps.manifest.outputs.local_manifest_id }} docker://ghcr.io/lkhn/sigstore-playground:zig-key)
+          printf '%s=%s\n' 'ghcr_manifest_id' "$ghcr_manifest_id" >> "$GITHUB_OUTPUT"
+
+      - name: Sign manifest on ghcr.io
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGSTORE_PRIVATE_KEY: ${{ secrets.SIGSTORE_PRIVATE_KEY }}
+        run: |
+          printf '%s\n' "${{ steps.ghcr_manifest.outputs.ghcr_manifest_id }}"
+          cosign sign --key env://SIGSTORE_PRIVATE_KEY --recursive ghcr.io/lkhn/sigstore-playground@${{ steps.ghcr_manifest.outputs.ghcr_manifest_id }}
+
+      - name: Verify container image with public key
+        run: |
+          cosign verify --key sigstore.pub ghcr.io/lkhn/sigstore-playground:zig-key

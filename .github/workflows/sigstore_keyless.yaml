@@ -1,0 +1,51 @@
+name: Keyless sign and verification with Sigstore Cosign
+on: workflow_dispatch
+permissions:
+  id-token: write # Required for generation ephemeral keys with GitHub OIDC provider.
+jobs:
+  signblob:
+    name: Keyless sign and verify a blob with Cosign
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.9.2 # Installs Cosign v2.5.3.
+
+      - name: Get zig release tarball as a blob
+        id: zig_release_tarball
+        run: |
+          zig_mirror=$(curl -sS -f https://ziglang.org/download/community-mirrors.txt | shuf -n 1)
+          zig_version=$(curl -sS -f https://ziglang.org/download/index.json | jq -r '.master.version')
+          zig_tarball_x86_64_linux_master="zig-x86_64-linux-${zig_version}.tar.xz"
+          printf '%s=%s\n' 'zig_tarball_x86_64_linux_master' "$zig_tarball_x86_64_linux_master" >> "$GITHUB_OUTPUT"
+          curl -sS -f ${zig_mirror}/${zig_tarball_x86_64_linux_master} -o ${zig_tarball_x86_64_linux_master}
+
+      - name: Sign a blob # Generates Sigstore Bundle (See: https://docs.sigstore.dev/about/bundle)
+        run: |
+          cosign sign-blob \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format \
+              --yes
+
+      # Blob, Sigstore Bundle and OIDC Provider (GitHub) are used for verification.
+
+      # https://github.com/<USER>/<REPOSITORY>/.github/workflows/<WORKFLOW>@refs/heads/<BRANCH>
+      # In this case: https://github.com/LKHN/sigstore-playground/.github/workflows/sigstore_keyless.yaml@refs/heads/main
+      - name: Verify the signed blob against to exact certificate identity
+        run: |
+          cosign verify-blob \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format \
+              --certificate-identity="${GITHUB_SERVER_URL}"/"${GITHUB_WORKFLOW_REF}" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com
+
+      # Matches ^https://github.com/LKHN/sigstore-playground
+      - name: Verify the signed blob using regular expression
+        run: |
+          cosign verify-blob \
+              ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }} \
+              --bundle ${{ steps.zig_release_tarball.outputs.zig_tarball_x86_64_linux_master }}.sigstore.json \
+              --new-bundle-format \
+              --certificate-identity-regexp="^${GITHUB_SERVER_URL}"/"${GITHUB_REPOSITORY}" \
+              --certificate-oidc-issuer=https://token.actions.githubusercontent.com
