@@ -1,0 +1,12 @@
+name: Build with GitHub Artifact Attestation
+on:
+  workflow_dispatch:
+jobs:
+  callsignandverify:
+    permissions:
+      attestations: write # GitHub Artifact attestations.
+      contents: read
+      id-token: write # Use GitHub OIDC provider to generate ephemeral keys for signing.
+      packages: write # Push container images to ghcr.io.
+    uses: ./.github/workflows/slsa_1.0_build_l3_reusable.yaml # When then caller and reusable workflow in the same repository.
+    # uses: LKHN/sigstore-playground/.github/workflows/slsa_1.0_build_l3_reusable.yaml@main # When caller and reusable workflow on different repositories.
